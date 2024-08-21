@@ -37,6 +37,10 @@ obj-y += gpt.o
 FILE_gpt.o := gpt.html
 FSPATH_gpt.o := gpt.html
 
+obj-y += production.o
+FILE_production.o := production.html
+FSPATH_production.o := production.html
+
 obj-y += style.o
 FILE_style.o := style.css
 FSPATH_style.o := style.css

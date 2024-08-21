@@ -154,6 +154,17 @@ static void upload_handler(enum httpd_uri_handler_status status,
 		goto done;
 	}
 
+	fw = httpd_request_find_value(request, "production");
+	if (fw) {
+		fw_type = FW_TYPE_ITB_FW;
+		if (failsafe_validate_image(fw->data, fw->size, fw_type))
+			goto fail;
+#ifdef CONFIG_MEDIATEK_MULTI_MTD_LAYOUT
+		mtd = httpd_request_find_value(request, "mtd_layout");
+#endif
+		goto done;
+	}
+
 fail:
 	response->data = "fail";
 	response->size = strlen(response->data);
@@ -385,6 +396,7 @@ int start_web_failsafe(void)
 	httpd_register_uri_handler(inst, "/uboot.html", &html_handler, NULL);
 	httpd_register_uri_handler(inst, "/bl2.html", &html_handler, NULL);
 	httpd_register_uri_handler(inst, "/getmtdlayout", &mtd_layout_handler, NULL);
+	httpd_register_uri_handler(inst, "/production.html", &html_handler, NULL);
 #ifdef CONFIG_MTK_BOOTMENU_MMC
 	httpd_register_uri_handler(inst, "/gpt.html", &html_handler, NULL);
 #endif

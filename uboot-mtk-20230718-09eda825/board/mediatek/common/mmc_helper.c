@@ -38,6 +38,7 @@
 
 #define PART_KERNEL_NAME	"kernel"
 #define PART_ROOTFS_NAME	"rootfs"
+#define PART_FIT_FIRMWARE   "production"
 
 struct mmc_image_read_priv {
 	struct image_read_priv p;
@@ -968,7 +969,10 @@ int mmc_boot_image(u32 dev)
 	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT))
 		return mmc_dual_boot(dev);
 
-	return boot_from_mmc_partition(dev, 0, PART_KERNEL_NAME);
+	if (-ENOENT == boot_from_mmc_partition(dev, 0, PART_FIT_FIRMWARE))
+		return boot_from_mmc_partition(dev, 0, PART_KERNEL_NAME);
+
+	return 0;
 }
 
 int mmc_upgrade_image(u32 dev, const void *data, size_t size)

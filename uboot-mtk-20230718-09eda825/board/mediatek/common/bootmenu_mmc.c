@@ -23,6 +23,7 @@
 
 #define PART_BL2_NAME		"bl2"
 #define PART_FIP_NAME		"fip"
+#define PART_PRODUCTION_NAME		"production"
 
 static int write_part(const char *partname, const void *data, size_t size,
 		      bool verify)
@@ -70,6 +71,12 @@ static int write_fip(void *priv, const struct data_part_entry *dpe,
 		     const void *data, size_t size)
 {
 	return write_part(PART_FIP_NAME, data, size, true);
+}
+
+static int write_itb_firmware(void *priv, const struct data_part_entry *dpe,
+		     const void *data, size_t size)
+{
+	return write_part(PART_PRODUCTION_NAME, data, size, true);
 }
 
 #ifdef CONFIG_MTK_FIP_SUPPORT
@@ -188,6 +195,24 @@ static int validate_fip_image(void *priv, const struct data_part_entry *dpe,
 			cprintln(ERROR, "*** FIP verification failed ***");
 			ret = -EBADMSG;
 		}
+	}
+
+	return ret;
+}
+
+static int validate_itb_firmware_image(void *priv, const struct data_part_entry *dpe,
+			      const void *data, size_t size)
+{
+	int ret = 0;
+
+	if (IS_ENABLED(CONFIG_MTK_UPGRADE_FIP_VERIFY)) {
+#if 0
+		ret = fip_check_uboot_data(data, size);
+		if (ret) {
+			cprintln(ERROR, "*** FIP verification failed ***");
+			ret = -EBADMSG;
+		}
+#endif
 	}
 
 	return ret;
@@ -334,6 +359,14 @@ static const struct data_part_entry mmc_parts[] = {
 		.env_name = "bootfile.simg",
 		.write = write_flash_image,
 		.validate = validate_simg_image,
+	},
+	{
+		.name = "Firmware FIP",
+		.abbr = "production",
+		.env_name = "sysupgrade.itb",
+		.validate = validate_itb_firmware_image,
+		.write = write_itb_firmware,
+		.post_action = UPGRADE_ACTION_CUSTOM,
 	},
 	{
 		.name = "Partition table",
