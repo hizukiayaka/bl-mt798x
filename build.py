@@ -6,9 +6,41 @@ import git
 import shutil
 import subprocess
 
+from enum import Enum, auto
 from git import Repo
 from pathlib import Path
 from tarfile import TarFile
+from typing import TypedDict, Required, NotRequired
+
+class MtkFilogic(Enum):
+    MT7981A = auto()
+    MT7981B = auto()
+    MT7986A = auto()
+    MT7986B = auto()
+    MT7988 = auto()
+    MT7988D = auto()
+
+class MemoryChipType(Enum):
+    DDR = auto()
+    DDR2 = auto()
+    DDR3 = auto()
+    LPDDR3 = auto()
+    DDR4 = auto()
+    LPDDR4 = auto()
+
+class StorageChipType(Enum):
+    NOR = auto()
+    NAND = auto()
+    SPI_NAND = auto()
+    EMMC = auto()
+
+class RouterMachine(TypedDict):
+    name: Required[str]
+    description: NotRequired[str]
+    soc: Required[MtkFilogic]
+    ram: Required[MemoryChipType]
+    storage: Required[StorageChipType]
+    defconfig: NotRequired[str]
 
 def check_build_directory(sub_mod: git.objects.submodule.base.Submodule):
     mod_name = sub_mod.name
@@ -41,14 +73,16 @@ def copy_and_apply_patches():
     [copy_quilt_files_to_build(sm) for sm in sms]
 
 if __name__ == '__main__':
-    targets = ['all', 'atf', 'u-boot']
-    machines = [ \
+    machines : list[RouterMachine] = [ \
             {'name': 'jdcloud-re-cp-03', 'description': 'JD Cloud Bali AX6000',
-             'soc': 'MT7986', 'ram': 'DDR4', 'sotarge': 'EMMC',
-             'dts': 'mt7986a-jdcloud_re-cp-03'},
+             'soc': MtkFilogic.MT7986A, 'ram': MemoryChipType.DDR4,
+             'storage': StorageChipType.EMMC,
+             'defconfig': 'mt7986a-jdcloud_re-cp-03'},
             ]
 
     machines_choices = [d['name'] for d in machines]
+
+    targets = ['all', 'atf', 'u-boot']
 
     parser = argparse.ArgumentParser(prog='build.py')
     subparsers = parser.add_subparsers(dest='step')
