@@ -1,0 +1,798 @@
+From 5a8c800d777676b5bfce16d41212bfb0104ed23a Mon Sep 17 00:00:00 2001
+From: Weijie Gao <weijie.gao@mediatek.com>
+Date: Thu, 13 Jul 2023 11:19:12 +0800
+Subject: [PATCH 4/7] Add support for simple Web-based failsafe UI
+
+This patch adds simple Web-based failsafe UI frameowrk.
+It supports firmware upgrade and can only be started in command line at
+present.
+
+Simple fs support is also included.
+Files can be directly embedded into U-Boot binary.
+
+Signed-off-by: Weijie Gao <weijie.gao@mediatek.com>
+---
+ Kconfig                            |   2 +
+ Makefile                           |   1 +
+ failsafe/Kconfig                   |  11 +
+ failsafe/Makefile                  |   9 +
+ failsafe/failsafe.c                | 334 +++++++++++++++++++++++++++++
+ failsafe/fs.c                      |  26 +++
+ failsafe/fs.h                      |  19 ++
+ failsafe/fsdata/404.html           |  15 ++
+ failsafe/fsdata/Makefile           |  62 ++++++
+ failsafe/fsdata/embed.S            |  31 +++
+ failsafe/fsdata/fail.html          |   2 +
+ failsafe/fsdata/flashing.html      |  32 +++
+ failsafe/fsdata/index.html         |  19 ++
+ failsafe/fsdata/style.css          |  26 +++
+ failsafe/fsdata/success.html       |   2 +
+ failsafe/fsdata/upload.html        |  23 ++
+ failsafe/fsdata/validate_fail.html |  16 ++
+ 17 files changed, 630 insertions(+)
+ create mode 100644 failsafe/Kconfig
+ create mode 100644 failsafe/Makefile
+ create mode 100644 failsafe/failsafe.c
+ create mode 100644 failsafe/fs.c
+ create mode 100644 failsafe/fs.h
+ create mode 100644 failsafe/fsdata/404.html
+ create mode 100644 failsafe/fsdata/Makefile
+ create mode 100644 failsafe/fsdata/embed.S
+ create mode 100644 failsafe/fsdata/fail.html
+ create mode 100644 failsafe/fsdata/flashing.html
+ create mode 100644 failsafe/fsdata/index.html
+ create mode 100644 failsafe/fsdata/style.css
+ create mode 100644 failsafe/fsdata/success.html
+ create mode 100644 failsafe/fsdata/upload.html
+ create mode 100644 failsafe/fsdata/validate_fail.html
+
+diff --git a/Kconfig b/Kconfig
+index 694f6b4fb6..7f97beb427 100644
+--- a/Kconfig
++++ b/Kconfig
+@@ -758,3 +758,5 @@ source "lib/Kconfig"
+ source "test/Kconfig"
+ 
+ source "tools/Kconfig"
++
++source "failsafe/Kconfig"
+diff --git a/Makefile b/Makefile
+index 1c754ceb59..cadf884eaa 100644
+--- a/Makefile
++++ b/Makefile
+@@ -887,6 +887,7 @@ libs-$(CONFIG_$(SPL_TPL_)UNIT_TEST) += test/
+ libs-$(CONFIG_UT_ENV) += test/env/
+ libs-$(CONFIG_UT_OPTEE) += test/optee/
+ libs-$(CONFIG_UT_OVERLAY) += test/overlay/
++libs-$(CONFIG_WEBUI_FAILSAFE) += failsafe/
+ 
+ libs-y += $(if $(wildcard $(srctree)/board/$(BOARDDIR)/Makefile),board/$(BOARDDIR)/)
+ 
+diff --git a/failsafe/Kconfig b/failsafe/Kconfig
+new file mode 100644
+index 0000000000..0a09b3957a
+--- /dev/null
++++ b/failsafe/Kconfig
+@@ -0,0 +1,11 @@
++#
++# Failsafe Web UI
++#
++
++config WEBUI_FAILSAFE
++	bool "Enable Failsafe Web UI"
++	select MTK_TCP
++	select MTK_HTTPD
++	default n
++	help
++	  Enable Web based failsafe UI
+diff --git a/failsafe/Makefile b/failsafe/Makefile
+new file mode 100644
+index 0000000000..b760180fda
+--- /dev/null
++++ b/failsafe/Makefile
+@@ -0,0 +1,9 @@
++# SPDX-License-Identifier: GPL-2.0
++
++ifeq ($(CONFIG_SPL_BUILD),)
++
++obj-y += fsdata/
++
++obj-y += fs.o failsafe.o
++
++endif
+diff --git a/failsafe/failsafe.c b/failsafe/failsafe.c
+new file mode 100644
+index 0000000000..ff357b4763
+--- /dev/null
++++ b/failsafe/failsafe.c
+@@ -0,0 +1,334 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2022 MediaTek Inc. All Rights Reserved.
++ *
++ * Author: Weijie Gao <weijie.gao@mediatek.com>
++ *
++ * Failsafe Web UI
++ */
++
++#include <command.h>
++#include <errno.h>
++#include <malloc.h>
++#include <net.h>
++#include <net/mtk_tcp.h>
++#include <net/mtk_httpd.h>
++#include <u-boot/md5.h>
++#include <vsprintf.h>
++#include "fs.h"
++
++static u32 upload_data_id;
++static const void *upload_data;
++static size_t upload_size;
++static int upgrade_success;
++
++int __weak failsafe_validate_image(const void *data, size_t size)
++{
++	return 0;
++}
++
++int __weak failsafe_write_image(const void *data, size_t size)
++{
++	return -ENOSYS;
++}
++
++static int output_plain_file(struct httpd_response *response,
++			     const char *filename)
++{
++	const struct fs_desc *file;
++	int ret = 0;
++
++	file = fs_find_file(filename);
++
++	response->status = HTTP_RESP_STD;
++
++	if (file) {
++		response->data = file->data;
++		response->size = file->size;
++	} else {
++		response->data = "Error: file not found";
++		response->size = strlen(response->data);
++		ret = 1;
++	}
++
++	response->info.code = 200;
++	response->info.connection_close = 1;
++	response->info.content_type = "text/html";
++
++	return ret;
++}
++
++static void index_handler(enum httpd_uri_handler_status status,
++			  struct httpd_request *request,
++			  struct httpd_response *response)
++{
++	if (status == HTTP_CB_NEW)
++		output_plain_file(response, "index.html");
++}
++
++struct upload_status {
++	bool free_response_data;
++};
++
++static void upload_handler(enum httpd_uri_handler_status status,
++			  struct httpd_request *request,
++			  struct httpd_response *response)
++{
++	char *buff, *md5_ptr, *size_ptr, size_str[16];
++	struct httpd_form_value *fw;
++	struct upload_status *us;
++	u8 md5_sum[16];
++	int i;
++
++	static char hexchars[] = "0123456789abcdef";
++
++	if (status == HTTP_CB_NEW) {
++		us = calloc(1, sizeof(*us));
++		if (!us) {
++			response->info.code = 500;
++			return;
++		}
++
++		response->session_data = us;
++
++		fw = httpd_request_find_value(request, "firmware");
++		if (!fw) {
++			response->info.code = 302;
++			response->info.connection_close = 1;
++			response->info.location = "/";
++			return;
++		}
++
++		if (failsafe_validate_image(fw->data, fw->size)) {
++			if (output_plain_file(response, "validate_fail.html"))
++				response->info.code = 500;
++
++			return;
++		}
++
++		if (output_plain_file(response, "upload.html")) {
++			response->info.code = 500;
++			return;
++		}
++
++		buff = malloc(response->size + 1);
++		if (buff) {
++			memcpy(buff, response->data, response->size);
++			buff[response->size] = 0;
++
++			md5_ptr = strstr(buff, "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
++			size_ptr = strstr(buff, "YYYYYYYYYY");
++
++			if (md5_ptr) {
++				md5((u8 *)fw->data, fw->size, md5_sum);
++				for (i = 0; i < 16; i++) {
++					u8 hex;
++
++					hex = (md5_sum[i] >> 4) & 0xf;
++					md5_ptr[i * 2] = hexchars[hex];
++					hex = md5_sum[i] & 0xf;
++					md5_ptr[i * 2 + 1] = hexchars[hex];
++				}
++			}
++
++			if (size_ptr) {
++				u32 n;
++
++				n = snprintf(size_str, sizeof(size_str), "%zu",
++					     fw->size);
++				memset(size_str + n, ' ', sizeof(size_str) - n);
++				memcpy(size_ptr, size_str, 10);
++			}
++
++			response->data = buff;
++			us->free_response_data = true;
++		}
++
++		upload_data_id = upload_id;
++		upload_data = fw->data;
++		upload_size = fw->size;
++
++		return;
++	}
++
++	if (status == HTTP_CB_CLOSED) {
++		if (response->session_data) {
++			us = response->session_data;
++
++			if (us->free_response_data)
++				free((void *)response->data);
++
++			free(response->session_data);
++		}
++	}
++}
++
++static void flashing_handler(enum httpd_uri_handler_status status,
++			     struct httpd_request *request,
++			     struct httpd_response *response)
++{
++	if (status == HTTP_CB_NEW)
++		output_plain_file(response, "flashing.html");
++}
++
++struct flashing_status {
++	char buf[4096];
++	int ret;
++	int body_sent;
++};
++
++static void result_handler(enum httpd_uri_handler_status status,
++			  struct httpd_request *request,
++			  struct httpd_response *response)
++{
++	const struct fs_desc *file;
++	struct flashing_status *st;
++	u32 size;
++
++	if (status == HTTP_CB_NEW) {
++		st = calloc(1, sizeof(*st));
++		if (!st) {
++			response->info.code = 500;
++			return;
++		}
++
++		st->ret = -1;
++
++		response->session_data = st;
++
++		response->status = HTTP_RESP_CUSTOM;
++
++		response->info.http_1_0 = 1;
++		response->info.content_length = -1;
++		response->info.connection_close = 1;
++		response->info.content_type = "text/html";
++		response->info.code = 200;
++
++		size = http_make_response_header(&response->info,
++			st->buf, sizeof(st->buf));
++
++		response->data = st->buf;
++		response->size = size;
++
++		return;
++	}
++
++	if (status == HTTP_CB_RESPONDING) {
++		st = response->session_data;
++
++		if (st->body_sent) {
++			response->status = HTTP_RESP_NONE;
++			return;
++		}
++
++		if (upload_data_id == upload_id)
++			st->ret = failsafe_write_image(upload_data,
++						       upload_size);
++
++		/* invalidate upload identifier */
++		upload_data_id = rand();
++
++		if (!st->ret)
++			file = fs_find_file("success.html");
++		else
++			file = fs_find_file("fail.html");
++
++		if (!file) {
++			if (!st->ret)
++				response->data = "Upgrade completed!";
++			else
++				response->data = "Upgrade failed!";
++			response->size = strlen(response->data);
++			return;
++		}
++
++		response->data = file->data;
++		response->size = file->size;
++
++		st->body_sent = 1;
++
++		return;
++	}
++
++	if (status == HTTP_CB_CLOSED) {
++		st = response->session_data;
++
++		upgrade_success = !st->ret;
++
++		free(response->session_data);
++
++		if (upgrade_success)
++			mtk_tcp_close_all_conn();
++	}
++}
++
++static void style_handler(enum httpd_uri_handler_status status,
++			  struct httpd_request *request,
++			  struct httpd_response *response)
++{
++	if (status == HTTP_CB_NEW) {
++		output_plain_file(response, "style.css");
++		response->info.content_type = "text/css";
++	}
++}
++
++static void not_found_handler(enum httpd_uri_handler_status status,
++			      struct httpd_request *request,
++			      struct httpd_response *response)
++{
++	if (status == HTTP_CB_NEW) {
++		output_plain_file(response, "404.html");
++		response->info.code = 404;
++	}
++}
++
++int start_web_failsafe(void)
++{
++	struct httpd_instance *inst;
++
++	inst = httpd_find_instance(80);
++	if (inst)
++		httpd_free_instance(inst);
++
++	inst = httpd_create_instance(80);
++	if (!inst) {
++		printf("Error: failed to create HTTP instance on port 80\n");
++		return -1;
++	}
++
++	httpd_register_uri_handler(inst, "/", &index_handler, NULL);
++	httpd_register_uri_handler(inst, "/cgi-bin/luci", &index_handler, NULL);
++	httpd_register_uri_handler(inst, "/upload", &upload_handler, NULL);
++	httpd_register_uri_handler(inst, "/flashing", &flashing_handler, NULL);
++	httpd_register_uri_handler(inst, "/result", &result_handler, NULL);
++	httpd_register_uri_handler(inst, "/style.css", &style_handler, NULL);
++	httpd_register_uri_handler(inst, "", &not_found_handler, NULL);
++
++	net_loop(MTK_TCP);
++
++	return 0;
++}
++
++static int do_httpd(struct cmd_tbl *cmdtp, int flag, int argc,
++		    char *const argv[])
++{
++	u32 local_ip = ntohl(net_ip.s_addr);
++	int ret;
++
++	printf("\nWeb failsafe UI started\n");
++	printf("URL: http://%u.%u.%u.%u/\n",
++	       (local_ip >> 24) & 0xff, (local_ip >> 16) & 0xff,
++	       (local_ip >> 8) & 0xff, local_ip & 0xff);
++	printf("\nPress Ctrl+C to exit\n");
++
++	ret = start_web_failsafe();
++
++	if (upgrade_success)
++		do_reset(NULL, 0, 0, NULL);
++
++	return ret;
++}
++
++U_BOOT_CMD(httpd, 1, 0, do_httpd,
++	"Start failsafe HTTP server", ""
++);
+diff --git a/failsafe/fs.c b/failsafe/fs.c
+new file mode 100644
+index 0000000000..d4f2e5819e
+--- /dev/null
++++ b/failsafe/fs.c
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2022 MediaTek Inc. All Rights Reserved.
++ *
++ * Author: Weijie Gao <weijie.gao@mediatek.com>
++ */
++
++#include <common.h>
++
++#include "fs.h"
++
++const struct fs_desc *fs_find_file(const char *path)
++{
++	struct fs_desc *start = ll_entry_start(struct fs_desc, fs);
++	int len = ll_entry_count(struct fs_desc, fs);
++
++	while (len) {
++		if (!strcmp(start->path, path))
++			return start;
++
++		len--;
++		start++;
++	}
++
++	return NULL;
++}
+diff --git a/failsafe/fs.h b/failsafe/fs.h
+new file mode 100644
+index 0000000000..b5d428d8b2
+--- /dev/null
++++ b/failsafe/fs.h
+@@ -0,0 +1,19 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2022 MediaTek Inc. All Rights Reserved.
++ *
++ * Author: Weijie Gao <weijie.gao@mediatek.com>
++ */
++
++#ifndef _FAILSAFE_FS_H_
++#define _FAILSAFE_FS_H_
++
++struct fs_desc {
++	const char *path;
++	size_t size;
++	const void *data;
++};
++
++const struct fs_desc *fs_find_file(const char *path);
++
++#endif /* _FAILSAFE_FS_H_ */
+diff --git a/failsafe/fsdata/404.html b/failsafe/fsdata/404.html
+new file mode 100644
+index 0000000000..00149521fe
+--- /dev/null
++++ b/failsafe/fsdata/404.html
+@@ -0,0 +1,15 @@
++<!DOCTYPE html>
++<html>
++<head>
++	<title>404 - MediaTek System Recovery Mode</title>
++	<link rel="stylesheet" type="text/css" href="/style.css">
++</head>
++<body>
++	<div id="banner">
++		MediaTek U-Boot System Recovery Mode
++	</div>
++	<div id="main">
++		<p><strong>Page not found</strong></p>
++	</div>
++</body>
++</html>
+\ No newline at end of file
+diff --git a/failsafe/fsdata/Makefile b/failsafe/fsdata/Makefile
+new file mode 100644
+index 0000000000..f80991fc2b
+--- /dev/null
++++ b/failsafe/fsdata/Makefile
+@@ -0,0 +1,62 @@
++# SPDX-License-Identifier: GPL-2.0
++
++# example:
++# obj-y += XXXX.o <- object file to generate
++# FILE_XXXX.o := YYYY.html <- actual html file to be embedded
++# FSPATH_XXXX.o := ZZZ/WWW.EXT <- virtual fs path to be used inside u-boot
++
++obj-y += index.o
++FILE_index.o := index.html
++FSPATH_index.o := index.html
++
++obj-y += upload.o
++FILE_upload.o := upload.html
++FSPATH_upload.o := upload.html
++
++obj-y += flashing.o
++FILE_flashing.o := flashing.html
++FSPATH_flashing.o := flashing.html
++
++obj-y += success.o
++FILE_success.o := success.html
++FSPATH_success.o := success.html
++
++obj-y += fail.o
++FILE_fail.o := fail.html
++FSPATH_fail.o := fail.html
++
++obj-y += validate_fail.o
++FILE_validate_fail.o := validate_fail.html
++FSPATH_validate_fail.o := validate_fail.html
++
++obj-y += 404.o
++FILE_404.o := 404.html
++FSPATH_404.o := 404.html
++
++obj-y += style.o
++FILE_style.o := style.css
++FSPATH_style.o := style.css
++
++# customized build rules
++strip_path = $(subst /,_,$(subst -,_,$(subst .,_,$(1))))
++
++quiet_cmd_as_o_html = AS      $@
++cmd_as_o_html = $(CC) $(a_flags) -c -o $@ \
++		-DDATA_SECT_NAME="\".rodata.fsdata.$(call strip_path,$(FSPATH_$(@F)))\"" \
++		-DDATA_OBJ_FILE="\"$(srctree)/$(obj)/$(FILE_$(@F))\"" \
++		-DDATA_OBJ_NAME="fsdata_$(call strip_path,$(FSPATH_$(@F)))" \
++		-DDATA_SIZE_NAME="fsdata_size_$(call strip_path,$(FSPATH_$(@F)))" \
++		-DDATA_SECT_FSPATH_NAME="\".rodata.fsdata.path.$(call strip_path,$(FSPATH_$(@F)))\"" \
++		-DDATA_OBJ_FSPATH_NAME="fsdata_path_$(call strip_path,$(FSPATH_$(@F)))" \
++		-DDATA_OBJ_FSPATH="\"$(FSPATH_$(@F))\"" \
++		-DUBOOT_LIST_SECT_NAME="\"__u_boot_list_2_fs_2_$(call strip_path,$(FSPATH_$(@F)))\"" \
++		-DUBOOT_LIST_NAME="fsdata_ulist_$(call strip_path,$(FSPATH_$(@F)))" \
++		$(srctree)/$(src)/embed.S
++
++$(obj)/%.o: $(src)/%.html FORCE
++	$(call cmd,force_checksrc)
++	$(call if_changed_dep,as_o_html)
++
++$(obj)/%.o: $(src)/%.css FORCE
++	$(call cmd,force_checksrc)
++	$(call if_changed_dep,as_o_html)
+diff --git a/failsafe/fsdata/embed.S b/failsafe/fsdata/embed.S
+new file mode 100644
+index 0000000000..67fa236f5c
+--- /dev/null
++++ b/failsafe/fsdata/embed.S
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2022 MediaTek Inc. All Rights Reserved.
++ *
++ * Author: Weijie Gao <weijie.gao@mediatek.com>
++ */
++
++.align	2
++.section	DATA_SECT_NAME, "a"
++.type	DATA_OBJ_NAME, @object
++DATA_OBJ_NAME:
++	.incbin DATA_OBJ_FILE
++.equ	DATA_SIZE_NAME, . - DATA_OBJ_NAME
++.size	DATA_OBJ_NAME, DATA_SIZE_NAME
++
++.align	2
++.section	DATA_SECT_FSPATH_NAME, "a"
++.type	DATA_OBJ_FSPATH_NAME, @object
++DATA_OBJ_FSPATH_NAME:
++	.asciz DATA_OBJ_FSPATH
++.size	DATA_OBJ_FSPATH_NAME, . - DATA_OBJ_FSPATH_NAME
++
++.align	2
++.section	UBOOT_LIST_SECT_NAME, "a"
++.globl	UBOOT_LIST_NAME
++.type	UBOOT_LIST_NAME, @object
++UBOOT_LIST_NAME:
++	.quad	DATA_OBJ_FSPATH_NAME
++	.quad	DATA_SIZE_NAME
++	.quad	DATA_OBJ_NAME
++.size	UBOOT_LIST_NAME, . - UBOOT_LIST_NAME
+diff --git a/failsafe/fsdata/fail.html b/failsafe/fsdata/fail.html
+new file mode 100644
+index 0000000000..5146586491
+--- /dev/null
++++ b/failsafe/fsdata/fail.html
+@@ -0,0 +1,2 @@
++<p><strong>Upgrade failed!</strong></p>
++<p><input type="button" value="Return" onclick="location='/'" /></p>
+\ No newline at end of file
+diff --git a/failsafe/fsdata/flashing.html b/failsafe/fsdata/flashing.html
+new file mode 100644
+index 0000000000..29193cb939
+--- /dev/null
++++ b/failsafe/fsdata/flashing.html
+@@ -0,0 +1,32 @@
++<!DOCTYPE html>
++<html>
++<head>
++	<title>Flashing - MediaTek System Recovery Mode</title>
++	<link rel="stylesheet" type="text/css" href="/style.css">
++</head>
++<body>
++	<div id="banner">
++		MediaTek U-Boot System Recovery Mode
++	</div>
++	<div id="main">
++		<p>Upgrading is in progressing, please wait ...</p>
++		<p>This page may be in not responding status for a short time.</p>
++	</div>
++	<script type="text/javascript">
++		var interval = window.setInterval(function () {
++			var xmlhttp = new XMLHttpRequest();
++
++			window.clearInterval(interval);
++
++			xmlhttp.timeout = 300000;
++			xmlhttp.open("GET", "/result", true);
++			xmlhttp.send();
++			xmlhttp.onreadystatechange = function () {
++				if (xmlhttp.readyState == 4 && xmlhttp.status == 200) {
++					document.getElementById("main").innerHTML = xmlhttp.responseText;
++				}
++			}
++		}, 1000);
++	</script>
++</body>
++</html>
+\ No newline at end of file
+diff --git a/failsafe/fsdata/index.html b/failsafe/fsdata/index.html
+new file mode 100644
+index 0000000000..0a76495fb8
+--- /dev/null
++++ b/failsafe/fsdata/index.html
+@@ -0,0 +1,19 @@
++<!doctype html>
++<html>
++<head>
++	<title>MediaTek System Recovery Mode</title>
++	<link rel="stylesheet" type="text/css" href="/style.css">
++</head>
++<body>
++	<div id="banner">
++		MediaTek U-Boot System Recovery Mode
++	</div>
++	<div id="main">
++		<p>Upload new firmware:</p>
++		<form action="/upload" method="post" enctype="multipart/form-data">
++			<p><input type="file" name="firmware" /></p>
++			<p><input type="submit" id="submit" value="Upload" /></p>
++		</form>
++	</div>
++</body>
++</html>
+\ No newline at end of file
+diff --git a/failsafe/fsdata/style.css b/failsafe/fsdata/style.css
+new file mode 100644
+index 0000000000..5c1db2dd0e
+--- /dev/null
++++ b/failsafe/fsdata/style.css
+@@ -0,0 +1,26 @@
++
++body {
++	padding: 1em;
++}
++
++#banner {
++	width: 100%;
++	height: 40px;
++	font-size: 2em;
++	text-align: center;
++	margin-bottom: 30px;
++}
++
++#main {
++	width: 500px;
++	margin: auto;
++}
++
++#submit {
++	display: block;
++	margin: auto;
++}
++
++#fileinfo {
++	padding-left: 20px;
++}
+\ No newline at end of file
+diff --git a/failsafe/fsdata/success.html b/failsafe/fsdata/success.html
+new file mode 100644
+index 0000000000..2a195e64b1
+--- /dev/null
++++ b/failsafe/fsdata/success.html
+@@ -0,0 +1,2 @@
++<p><strong>Upgrade complete!</strong></p>
++<p>Rebooting ...</p>
+\ No newline at end of file
+diff --git a/failsafe/fsdata/upload.html b/failsafe/fsdata/upload.html
+new file mode 100644
+index 0000000000..d42036a49c
+--- /dev/null
++++ b/failsafe/fsdata/upload.html
+@@ -0,0 +1,23 @@
++<!doctype html>
++<html>
++<head>
++	<title>Confirm - MediaTek System Recovery Mode</title>
++	<link rel="stylesheet" type="text/css" href="/style.css">
++</head>
++<body>
++	<div id="banner">
++		MediaTek U-Boot System Recovery Mode
++	</div>
++	<div id="main">
++		<p>File confirmation:</p>
++		<div id="fileinfo">
++			<p>MD5: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</p>
++			<p>Size: YYYYYYYYYY Bytes</p>
++		</div>
++		<p>If all information above is correct, click [Proceed].</p>
++		<form action="/flashing" method="post" enctype="multipart/form-data">
++			<p><input type="submit" id="submit" value="Proceed" /></p>
++		</form>
++	</div>
++</body>
++</html>
+\ No newline at end of file
+diff --git a/failsafe/fsdata/validate_fail.html b/failsafe/fsdata/validate_fail.html
+new file mode 100644
+index 0000000000..abc5482ff0
+--- /dev/null
++++ b/failsafe/fsdata/validate_fail.html
+@@ -0,0 +1,16 @@
++<!doctype html>
++<html>
++<head>
++	<title>Error - MediaTek System Recovery Mode</title>
++	<link rel="stylesheet" type="text/css" href="/style.css">
++</head>
++<body>
++	<div id="banner">
++		MediaTek U-Boot System Recovery Mode
++	</div>
++	<div id="main">
++		<p><strong>Firmware image verification failed!</strong></p>
++		<p><input type="button" value="Return" onclick="location='/'" /></p>
++	</div>
++</body>
++</html>
+\ No newline at end of file
+-- 
+2.46.0
+

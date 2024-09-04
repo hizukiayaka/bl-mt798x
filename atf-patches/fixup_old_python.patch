@@ -1,0 +1,11 @@
+--- a/makeconfig_post.mk
++++ b/makeconfig_post.mk
+@@ -14,7 +14,7 @@
+ 
+ TOP_CONFIG := $(CURDIR)/Config.in
+ 
+-PYTHON := $(shell which python)
++PYTHON := $(shell which python3)
+ 
+ check_python:
+ ifeq ($(PYTHON),)

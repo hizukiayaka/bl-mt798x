@@ -1,0 +1,173 @@
+From 83f845191f3a1c15c88f864f5a1781c3f1e7a029 Mon Sep 17 00:00:00 2001
+From: ayaka <ayaka@soulik.info>
+Date: Thu, 29 Aug 2024 17:31:46 +0800
+Subject: [PATCH 7/7] mtk: detect button event in the autoboot
+
+---
+ board/mediatek/Kconfig                  |   4 +
+ board/mediatek/common/cmd_mtkautoboot.c | 122 +++++++++++++++++++++++-
+ 2 files changed, 123 insertions(+), 3 deletions(-)
+
+diff --git a/board/mediatek/Kconfig b/board/mediatek/Kconfig
+index 80c93bdf2c..ada2696dc6 100644
+--- a/board/mediatek/Kconfig
++++ b/board/mediatek/Kconfig
+@@ -146,6 +146,10 @@ config MTK_WEB_FAILSAFE_AFTER_BOOT_FAILURE
+ 	  firmware image available for boot.
+ 	  This requires booting system using mtkboardboot command.
+ 
++config MTK_WEB_FAILSAFE_INDICATOR_LED_LABEL
++	string "LED indicator label"
++	depends on MTK_WEB_FAILSAFE
++
+ config MTK_UBI_SUPPORT
+ 	bool "Enable support for UBI-based images"
+ 	select MTD_UBI
+diff --git a/board/mediatek/common/cmd_mtkautoboot.c b/board/mediatek/common/cmd_mtkautoboot.c
+index 3491eb6fe5..e4b3027a8a 100644
+--- a/board/mediatek/common/cmd_mtkautoboot.c
++++ b/board/mediatek/common/cmd_mtkautoboot.c
+@@ -8,7 +8,11 @@
+  */
+ 
+ #include <command.h>
++#include <button.h>
++#include <dm.h>
+ #include <env.h>
++#include <led.h>
++#include <linux/delay.h>
+ #include <stdio.h>
+ #include <vsprintf.h>
+ #include <linux/types.h>
+@@ -30,6 +34,120 @@ static int do_mtkautoboot(struct cmd_tbl *cmdtp, int flag, int argc,
+ 	const char *delay_str;
+ #endif
+ 
++#ifdef CONFIG_MTK_WEB_FAILSAFE
++	struct udevice *btn_dev;
++
++	if (!button_get_by_label("reset", &btn_dev)) {
++		struct udevice *dev, *led0, *led1;
++
++		led0 = NULL;
++		/* Turn off all the LEDs first */
++		for (uclass_first_device(UCLASS_LED, &dev);
++		     dev; uclass_next_device(&dev)) {
++			if (led_get_state(dev))
++				led0 = dev;
++			else if (!led0)
++				led0 = dev;
++			led_set_state(dev, LEDST_OFF);
++		}
++
++		dev = led0;
++#ifdef CONFIG_MTK_WEB_FAILSAFE_INDICATOR_LED_LABEL
++		if (sizeof(CONFIG_MTK_WEB_FAILSAFE_INDICATOR_LED_LABEL) > 1) {
++			if (led_get_by_label
++			    (CONFIG_MTK_WEB_FAILSAFE_INDICATOR_LED_LABEL,
++			     &led0))
++				led0 = dev;
++		}
++#else
++		if (led_get_by_label(env_get("bootled_pwr"), &led0))
++			led0 = dev;
++#endif
++		if (led_get_by_label(env_get("bootled_rec"), &led1))
++			led1 = led0;
++
++		printf("Hold the reset button to enter into httpd failsafe\n");
++
++		i = 0;
++		delay = 5;
++
++		do {
++			if (button_get_state(btn_dev)) {
++				schedule();
++
++				if (led0) {
++					led_set_state(led0, LEDST_OFF);
++					led_set_state(led1, LEDST_OFF);
++					mdelay(5);
++					led_set_state(led1, LEDST_ON);
++					mdelay(25);
++					led_set_state(led1, LEDST_OFF);
++					mdelay(20);
++					led_set_state(led0, LEDST_ON);
++					led_set_state(led1, LEDST_ON);
++					mdelay(10);
++					led_set_state(led1, LEDST_OFF);
++					mdelay(20);
++					led_set_state(led0, LEDST_OFF);
++					led_set_state(led1, LEDST_ON);
++					mdelay(20);
++				} else {
++					mdelay(100);
++				}
++
++				delay--;
++				i++;
++			} else {
++				schedule();
++
++				if (led0) {
++					led_set_state(led1, LEDST_OFF);
++					led_set_state(led0, LEDST_ON);
++					mdelay(50);
++					led_set_state(led0, LEDST_OFF);
++					mdelay(50);
++				} else {
++					mdelay(100);
++				}
++
++				delay--;
++				i--;
++			}
++
++			if (i > 10)
++				break;
++		} while ((i > 0) || (delay > 0));
++
++		if (i > 1) {
++			schedule();
++
++			printf("will enter into httpd failsafe\n");
++			for (i = 20; led0 && (i > 1); i--) {
++				led_set_state(led0, LEDST_OFF);
++				mdelay(5);
++				led_set_state(led1, LEDST_ON);
++				mdelay(5);
++				led_set_state(led1, LEDST_OFF);
++			}
++			schedule();
++			if (led0) {
++				led_set_state(led0, LEDST_ON);
++				led_set_state(led1, LEDST_ON);
++			}
++
++			run_command("httpd", 0);
++			return CMD_RET_SUCCESS;
++		} else {
++			if (led0) {
++				led_set_state(led1, LEDST_OFF);
++				mdelay(10);
++				led_set_state(led0, LEDST_ON);
++			}
++			delay = -1;
++		}
++	}
++#endif
++
+ 	board_bootmenu_entries(&menu_entries, &menu_count);
+ 
+ 	if (!menu_entries || !menu_count) {
+@@ -65,6 +183,4 @@ static int do_mtkautoboot(struct cmd_tbl *cmdtp, int flag, int argc,
+ 	return CMD_RET_SUCCESS;
+ }
+ 
+-U_BOOT_CMD(mtkautoboot, 1, 0, do_mtkautoboot,
+-	   "Display MediaTek bootmenu", ""
+-);
++U_BOOT_CMD(mtkautoboot, 1, 0, do_mtkautoboot, "Display MediaTek bootmenu", "");
+-- 
+2.46.0
+

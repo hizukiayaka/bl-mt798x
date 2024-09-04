@@ -1,0 +1,460 @@
+From 52d92c565043f759ee051046779aae443e3998dd Mon Sep 17 00:00:00 2001
+From: ayaka <ayaka@soulik.info>
+Date: Tue, 27 Aug 2024 18:12:41 +0800
+Subject: [PATCH 6/7] failsafe: support writing gpt/bl2/uboot/itb
+
+---
+ board/mediatek/common/bootmenu_mmc.c | 33 ++++++++++++--
+ board/mediatek/common/failsafe.c     | 41 +++++++++++++-----
+ board/mediatek/common/mmc_helper.c   |  8 +++-
+ board/mediatek/common/mtd_helper.c   |  2 +-
+ failsafe/failsafe.c                  | 64 +++++++++++++++++++++++++---
+ failsafe/fsdata/Makefile             |  4 ++
+ failsafe/fsdata/index.html           | 19 ++++++++-
+ failsafe/fsdata/success.html         |  1 -
+ failsafe/fsdata/upload.html          |  3 +-
+ include/failsafe.h                   | 14 ++++++
+ 10 files changed, 162 insertions(+), 27 deletions(-)
+ create mode 100644 include/failsafe.h
+
+diff --git a/board/mediatek/common/bootmenu_mmc.c b/board/mediatek/common/bootmenu_mmc.c
+index 95ec5131d8..7b355b5c57 100644
+--- a/board/mediatek/common/bootmenu_mmc.c
++++ b/board/mediatek/common/bootmenu_mmc.c
+@@ -23,6 +23,7 @@
+ 
+ #define PART_BL2_NAME		"bl2"
+ #define PART_FIP_NAME		"fip"
++#define PART_ITB_FW_NAME	"production"
+ 
+ static int write_part(const char *partname, const void *data, size_t size,
+ 		      bool verify)
+@@ -254,6 +255,20 @@ static int write_firmware(void *priv, const struct data_part_entry *dpe,
+ 	return mmc_upgrade_image(MMC_DEV_INDEX, data, size);
+ }
+ 
++#if defined(CONFIG_FIT)
++static int validate_itb_firmware(void *priv, const struct data_part_entry *dpe,
++			     const void *data, size_t size)
++{
++	return 0;
++}
++
++static int write_itb_firmware(void *priv, const struct data_part_entry *dpe,
++			  const void *data, size_t size)
++{
++	return write_part(PART_ITB_FW_NAME, data, size, true);
++}
++#endif
++
+ static int write_gpt(void *priv, const struct data_part_entry *dpe,
+ 		     const void *data, size_t size)
+ {
+@@ -298,7 +313,7 @@ static const struct data_part_entry mmc_parts[] = {
+ 		.env_name = "bootfile.fip",
+ 		.validate = validate_fip_image,
+ 		.write = write_fip,
+-		.post_action = UPGRADE_ACTION_CUSTOM,
++		.post_action = UPGRADE_ACTION_NONE,
+ 		.do_post_action = erase_env,
+ 	},
+ #ifdef CONFIG_MTK_FIP_SUPPORT
+@@ -321,13 +336,23 @@ static const struct data_part_entry mmc_parts[] = {
+ 	},
+ #endif
+ 	{
+-		.name = "Firmware",
+-		.abbr = "fw",
++		.name = "firmware(legacy)",
++		.abbr = "legacy",
+ 		.env_name = "bootfile",
+-		.post_action = UPGRADE_ACTION_BOOT,
++		.post_action = UPGRADE_ACTION_NONE,
+ 		.validate = validate_firmware,
+ 		.write = write_firmware,
+ 	},
++#if defined(CONFIG_FIT)
++	{
++		.name = "firmware FIP",
++		.abbr = "production",
++		.env_name = "bootfile",
++		.post_action = UPGRADE_ACTION_NONE,
++		.validate = validate_itb_firmware,
++		.write = write_itb_firmware,
++	},
++#endif
+ 	{
+ 		.name = "Single image",
+ 		.abbr = "simg",
+diff --git a/board/mediatek/common/failsafe.c b/board/mediatek/common/failsafe.c
+index 51e96bab46..e610f2416f 100644
+--- a/board/mediatek/common/failsafe.c
++++ b/board/mediatek/common/failsafe.c
+@@ -11,26 +11,45 @@
+ #include <errno.h>
+ #include <linux/string.h>
+ #include <asm/global_data.h>
++#include <failsafe.h>
+ #include "upgrade_helper.h"
+ #include "colored_print.h"
+ 
+ DECLARE_GLOBAL_DATA_PTR;
+ 
+-#define UPGRADE_PART		"fw"
+-
+ static const struct data_part_entry *find_part(const struct data_part_entry *parts,
+-					       u32 num_parts, const char *abbr)
++					       u32 num_parts,
++					       failsafe_fw_t fw_type)
+ {
++	const char *abbr = NULL;
+ 	u32 i;
+ 
+-	if (!abbr)
+-		return NULL;
++	switch(fw_type) {
++	case FW_TYPE_GPT:
++		abbr = "gpt";
++		break;
++	case FW_TYPE_BL2:
++		abbr = "bl2";
++		break;
++	case FW_TYPE_FIP:
++		abbr = "fip";
++		break;
++	case FW_TYPE_FW_LEGACY:
++		abbr = "fw";
++		break;
++	case FW_TYPE_ITB_FW:
++		abbr = "production";
++		break;
++	default:
++		goto failed;
++	}
+ 
+ 	for (i = 0; i < num_parts; i++) {
+-		if (!strcmp(parts[i].abbr, abbr))
++		if (!strncmp(parts[i].abbr, abbr, strlen(parts[i].abbr)))
+ 			return &parts[i];
+ 	}
+ 
++failed:
+ 	cprintln(ERROR, "*** Invalid upgrading part! ***");
+ 
+ 	return NULL;
+@@ -42,7 +61,8 @@ void *httpd_get_upload_buffer_ptr(size_t size)
+ 	return (void *)gd->ram_base + 0x4000000;
+ }
+ 
+-int failsafe_validate_image(const void *data, size_t size)
++int failsafe_validate_image(const failsafe_fw_t fw_type, const void *data,
++							size_t size)
+ {
+ 	const struct data_part_entry *upgrade_parts, *dpe;
+ 	u32 num_parts;
+@@ -54,7 +74,7 @@ int failsafe_validate_image(const void *data, size_t size)
+ 		return -ENOSYS;
+ 	}
+ 
+-	dpe = find_part(upgrade_parts, num_parts, UPGRADE_PART);
++	dpe = find_part(upgrade_parts, num_parts, fw_type);
+ 	if (!dpe)
+ 		return -ENODEV;
+ 
+@@ -64,7 +84,8 @@ int failsafe_validate_image(const void *data, size_t size)
+ 	return 0;
+ }
+ 
+-int failsafe_write_image(const void *data, size_t size)
++int failsafe_write_image(const failsafe_fw_t fw_type, const void *data,
++						 size_t size)
+ {
+ 	const struct data_part_entry *upgrade_parts, *dpe;
+ 	u32 num_parts;
+@@ -77,7 +98,7 @@ int failsafe_write_image(const void *data, size_t size)
+ 		return -ENOSYS;
+ 	}
+ 
+-	dpe = find_part(upgrade_parts, num_parts, UPGRADE_PART);
++	dpe = find_part(upgrade_parts, num_parts, fw_type);
+ 	if (!dpe)
+ 		return -ENODEV;
+ 
+diff --git a/board/mediatek/common/mmc_helper.c b/board/mediatek/common/mmc_helper.c
+index 0b5431a383..0590413854 100644
+--- a/board/mediatek/common/mmc_helper.c
++++ b/board/mediatek/common/mmc_helper.c
+@@ -38,6 +38,7 @@
+ 
+ #define PART_KERNEL_NAME	"kernel"
+ #define PART_ROOTFS_NAME	"rootfs"
++#define PART_FIT_FIRMWARE	"production"
+ 
+ struct mmc_image_read_priv {
+ 	struct image_read_priv p;
+@@ -691,7 +692,7 @@ static int _boot_from_mmc(struct mmc *mmc, u64 offset)
+ #endif
+ #if defined(CONFIG_FIT)
+ 	case IMAGE_FORMAT_FIT:
+-		size = fit_get_size((const void *)data_load_addr);
++		size = fit_get_totalsize((const void *)data_load_addr);
+ 		break;
+ #endif
+ 	default:
+@@ -968,7 +969,10 @@ int mmc_boot_image(u32 dev)
+ 	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT))
+ 		return mmc_dual_boot(dev);
+ 
+-	return boot_from_mmc_partition(dev, 0, PART_KERNEL_NAME);
++    if (-ENOENT == boot_from_mmc_partition(dev, 0, PART_FIT_FIRMWARE))
++		return boot_from_mmc_partition(dev, 0, PART_KERNEL_NAME);
++
++	return 0;
+ }
+ 
+ int mmc_upgrade_image(u32 dev, const void *data, size_t size)
+diff --git a/board/mediatek/common/mtd_helper.c b/board/mediatek/common/mtd_helper.c
+index 01373fcf9f..640f9e7ea2 100644
+--- a/board/mediatek/common/mtd_helper.c
++++ b/board/mediatek/common/mtd_helper.c
+@@ -494,7 +494,7 @@ int boot_from_mtd(struct mtd_info *mtd, u64 offset)
+ #endif
+ #if defined(CONFIG_FIT)
+ 	case IMAGE_FORMAT_FIT:
+-		size = fit_get_size((const void *)data_load_addr);
++		size = fit_get_totalsize((const void *)data_load_addr);
+ 		break;
+ #endif
+ 	default:
+diff --git a/failsafe/failsafe.c b/failsafe/failsafe.c
+index ff357b4763..14090ab806 100644
+--- a/failsafe/failsafe.c
++++ b/failsafe/failsafe.c
+@@ -15,19 +15,25 @@
+ #include <net/mtk_httpd.h>
+ #include <u-boot/md5.h>
+ #include <vsprintf.h>
++#include <failsafe.h>
+ #include "fs.h"
+ 
+ static u32 upload_data_id;
+ static const void *upload_data;
+ static size_t upload_size;
+ static int upgrade_success;
++/* Upload page would update its value */
++static failsafe_fw_t fw_type;
+ 
+-int __weak failsafe_validate_image(const void *data, size_t size)
++/* those two symbols are defined in board/mediatek/common/failsafe.c */
++int __weak failsafe_validate_image(const failsafe_fw_t fw_type,
++				   const void *data, size_t size)
+ {
+ 	return 0;
+ }
+ 
+-int __weak failsafe_write_image(const void *data, size_t size)
++int __weak failsafe_write_image(const failsafe_fw_t fw_type,
++		                const void *data, size_t size)
+ {
+ 	return -ENOSYS;
+ }
+@@ -66,6 +72,10 @@ static void index_handler(enum httpd_uri_handler_status status,
+ 		output_plain_file(response, "index.html");
+ }
+ 
++static void not_found_handler(enum httpd_uri_handler_status status,
++			      struct httpd_request *request,
++			      struct httpd_response *response);
++
+ struct upload_status {
+ 	bool free_response_data;
+ };
+@@ -76,6 +86,7 @@ static void upload_handler(enum httpd_uri_handler_status status,
+ {
+ 	char *buff, *md5_ptr, *size_ptr, size_str[16];
+ 	struct httpd_form_value *fw;
++	char *part_target_p;
+ 	struct upload_status *us;
+ 	u8 md5_sum[16];
+ 	int i;
+@@ -91,7 +102,19 @@ static void upload_handler(enum httpd_uri_handler_status status,
+ 
+ 		response->session_data = us;
+ 
+-		fw = httpd_request_find_value(request, "firmware");
++		if (fw = httpd_request_find_value(request, "firmware"), fw)
++			fw_type = FW_TYPE_ITB_FW;
++		else if (fw = httpd_request_find_value(request, "uboot"), fw)
++			fw_type = FW_TYPE_FIP;
++		else if (fw = httpd_request_find_value(request, "bl2"), fw)
++			fw_type = FW_TYPE_BL2;
++		else if (fw = httpd_request_find_value(request, "gpt"), fw)
++			fw_type = FW_TYPE_GPT;
++		else if (fw = httpd_request_find_value(request, "legacy"), fw)
++			fw_type = FW_TYPE_FW_LEGACY;
++		else
++			fw = NULL;
++
+ 		if (!fw) {
+ 			response->info.code = 302;
+ 			response->info.connection_close = 1;
+@@ -99,7 +122,7 @@ static void upload_handler(enum httpd_uri_handler_status status,
+ 			return;
+ 		}
+ 
+-		if (failsafe_validate_image(fw->data, fw->size)) {
++		if (failsafe_validate_image(fw_type, fw->data, fw->size)) {
+ 			if (output_plain_file(response, "validate_fail.html"))
+ 				response->info.code = 500;
+ 
+@@ -114,10 +137,11 @@ static void upload_handler(enum httpd_uri_handler_status status,
+ 		buff = malloc(response->size + 1);
+ 		if (buff) {
+ 			memcpy(buff, response->data, response->size);
+-			buff[response->size] = 0;
++			buff[response->size] = '\0';
+ 
+ 			md5_ptr = strstr(buff, "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+ 			size_ptr = strstr(buff, "YYYYYYYYYY");
++			part_target_p = strstr(buff, "UUUUUUUUUUUUUUUU");
+ 
+ 			if (md5_ptr) {
+ 				md5((u8 *)fw->data, fw->size, md5_sum);
+@@ -140,6 +164,34 @@ static void upload_handler(enum httpd_uri_handler_status status,
+ 				memcpy(size_ptr, size_str, 10);
+ 			}
+ 
++			if (part_target_p) {
++				size_t n;
++				const char *part_target_str;
++
++				switch (fw_type) {
++				case FW_TYPE_BL2:
++					part_target_str = "Preload";
++					break;
++				case FW_TYPE_FIP:
++					part_target_str = "ATF & U-Boot";
++					break;
++				case FW_TYPE_GPT:
++					part_target_str = "GPT";
++					break;
++				case FW_TYPE_FW_LEGACY:
++					part_target_str = "firmware(tar)";
++					break;
++				case FW_TYPE_ITB_FW:
++				default:
++					part_target_str = "firmware(fip)";
++					break;
++				}
++
++				n = strnlen(part_target_str, 16);
++				memcpy(part_target_p, part_target_str, n);
++				memset(part_target_p + n, ' ', 16 - n);
++			}
++
+ 			response->data = buff;
+ 			us->free_response_data = true;
+ 		}
+@@ -222,7 +274,7 @@ static void result_handler(enum httpd_uri_handler_status status,
+ 		}
+ 
+ 		if (upload_data_id == upload_id)
+-			st->ret = failsafe_write_image(upload_data,
++			st->ret = failsafe_write_image(fw_type, upload_data,
+ 						       upload_size);
+ 
+ 		/* invalidate upload identifier */
+diff --git a/failsafe/fsdata/Makefile b/failsafe/fsdata/Makefile
+index f80991fc2b..4733bdda3f 100644
+--- a/failsafe/fsdata/Makefile
++++ b/failsafe/fsdata/Makefile
+@@ -60,3 +60,7 @@ $(obj)/%.o: $(src)/%.html FORCE
+ $(obj)/%.o: $(src)/%.css FORCE
+ 	$(call cmd,force_checksrc)
+ 	$(call if_changed_dep,as_o_html)
++
++$(obj)/%.o: $(src)/%.js FORCE
++	$(call cmd,force_checksrc)
++	$(call if_changed_dep,as_o_html)
+diff --git a/failsafe/fsdata/index.html b/failsafe/fsdata/index.html
+index 0a76495fb8..e674e1d764 100644
+--- a/failsafe/fsdata/index.html
++++ b/failsafe/fsdata/index.html
+@@ -11,9 +11,24 @@
+ 	<div id="main">
+ 		<p>Upload new firmware:</p>
+ 		<form action="/upload" method="post" enctype="multipart/form-data">
+-			<p><input type="file" name="firmware" /></p>
++			<p><label for="firmware_type">Choose the firmware target:</label></p>
++			<select name="fw_type" id="firmware_type" onchange="updateFileInputName()">
++				<option value="firmware">Firmware in FIP format</option>
++				<option value="uboot">Arm Trusted Firmware and U-Boot</option>
++				<option value="bl2">Preload bootloader</option>
++				<option value="gpt">GPT partition table</option>
++				<option value="legacy">Firmware in legacy format</option>
++			</select>
++			<p><input type="file" id="file_input" accept=".fip,.itb,.bin" /></p>
+ 			<p><input type="submit" id="submit" value="Upload" /></p>
+ 		</form>
+ 	</div>
++	<script>
++		function updateFileInputName() {
++			const selectElement = document.getElementById('firmware_type');
++			const fileInputElement = document.getElementById('file_input');
++			fileInputElement.name = selectElement.value;
++		}
++	</script>
+ </body>
+-</html>
+\ No newline at end of file
++</html>
+diff --git a/failsafe/fsdata/success.html b/failsafe/fsdata/success.html
+index 2a195e64b1..d48a8d3ce8 100644
+--- a/failsafe/fsdata/success.html
++++ b/failsafe/fsdata/success.html
+@@ -1,2 +1 @@
+ <p><strong>Upgrade complete!</strong></p>
+-<p>Rebooting ...</p>
+\ No newline at end of file
+diff --git a/failsafe/fsdata/upload.html b/failsafe/fsdata/upload.html
+index d42036a49c..8577fc6f89 100644
+--- a/failsafe/fsdata/upload.html
++++ b/failsafe/fsdata/upload.html
+@@ -13,6 +13,7 @@
+ 		<div id="fileinfo">
+ 			<p>MD5: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</p>
+ 			<p>Size: YYYYYYYYYY Bytes</p>
++			<p>Firmware type: UUUUUUUUUUUUUUUU</p>
+ 		</div>
+ 		<p>If all information above is correct, click [Proceed].</p>
+ 		<form action="/flashing" method="post" enctype="multipart/form-data">
+@@ -20,4 +21,4 @@
+ 		</form>
+ 	</div>
+ </body>
+-</html>
+\ No newline at end of file
++</html>
+diff --git a/include/failsafe.h b/include/failsafe.h
+new file mode 100644
+index 0000000000..ee23c1a1e1
+--- /dev/null
++++ b/include/failsafe.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef _FAILSAFE_H_
++#define _FAILSAFE_H_
++
++typedef enum {
++	FW_TYPE_GPT,
++	FW_TYPE_BL2,
++	FW_TYPE_FIP,
++	FW_TYPE_FW_LEGACY,
++	FW_TYPE_ITB_FW,
++} failsafe_fw_t;
++
++#endif
+-- 
+2.46.0
+
