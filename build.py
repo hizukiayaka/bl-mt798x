@@ -3,6 +3,7 @@
 import argparse
 import io
 import git
+import multiprocessing
 import re
 import shutil
 import subprocess
@@ -160,6 +161,7 @@ def write_atf_config_file(machine: RouterMachine, boot_to_ram: bool):
         print('_ENABLE_I2C_SUPPORT=y', file=file)
         print('_ENABLE_EMERG_MEM_DUMP=y', file=file)
         print('_ENABLE_JTAG=y', file=file)
+        print('_BUILD_FIP=n', file=file)
 
     configed_stamp_file = Path(build_dir) / '.config_checked'
     try:
@@ -168,6 +170,30 @@ def write_atf_config_file(machine: RouterMachine, boot_to_ram: bool):
         configed_stamp_file.touch(exist_ok=True)
     except CalledProcessError:
         configed_stamp_file.unlink()
+
+def build_uboot():
+    build_dir = Path('build-u-boot')
+
+    built_stamp_file = Path(build_dir) / '.built_checked'
+    n_threads = multiprocessing.cpu_count()
+    try:
+        subprocess.run(['make', '-C', str(build_dir.absolute()), '-j', str(n_threads)],
+                       check=True, capture_output=True)
+        built_stamp_file.touch(exist_ok=True)
+    except CalledProcessError:
+        built_stamp_file.unlink()
+
+def build_atf():
+    build_dir = Path('build-atf')
+
+    built_stamp_file = Path(build_dir) / '.built_checked'
+    n_threads = multiprocessing.cpu_count()
+    try:
+        subprocess.run(['make', '-C', str(build_dir.absolute()), '-j', str(n_threads)],
+                       check=True, capture_output=True)
+        built_stamp_file.touch(exist_ok=True)
+    except CalledProcessError:
+        built_stamp_file.unlink()
 
 if __name__ == '__main__':
     machines : list[RouterMachine] = [ \
@@ -215,3 +241,12 @@ if __name__ == '__main__':
             machine = machines[index]
             write_atf_config_file(machine, args.boot_to_ram)
             configura_uboot(machine['defconfig'])
+        case 'build':
+            match args.target:
+                case 'all':
+                    build_uboot()
+                    build_atf()
+                case 'atf':
+                    build_atf()
+                case 'u-boot':
+                    build_uboot()
