@@ -139,7 +139,7 @@ def configura_uboot(defconfig : str):
         subprocess.run(['make', '-C', str(build_dir.absolute()), defconfig],
                        check=True, capture_output=True)
         configed_stamp_file.touch(exist_ok=True)
-    except CalledProcessError:
+    except subprocess.CalledProcessError:
         configed_stamp_file.unlink()
 
 def write_atf_config_file(machine: RouterMachine, boot_to_ram: bool):
@@ -168,28 +168,30 @@ def write_atf_config_file(machine: RouterMachine, boot_to_ram: bool):
         subprocess.run(['make', '-C', str(build_dir.absolute()), 'defconfig'],
                        check=True, capture_output=True)
         configed_stamp_file.touch(exist_ok=True)
-    except CalledProcessError:
+    except subprocess.CalledProcessError:
         configed_stamp_file.unlink()
 
-def build_uboot():
+def build_uboot(crossprefix : str):
     build_dir = Path('build-u-boot')
 
     built_stamp_file = Path(build_dir) / '.built_checked'
     n_threads = multiprocessing.cpu_count()
     try:
-        subprocess.run(['make', '-C', str(build_dir.absolute()), '-j', str(n_threads)],
+        subprocess.run(['make', '-C', str(build_dir.absolute()), '-j', str(n_threads),
+                        'CROSS_COMPILE={}'.format(crossprefix)],
                        check=True, capture_output=True)
         built_stamp_file.touch(exist_ok=True)
-    except CalledProcessError:
+    except subprocess.CalledProcessError:
         built_stamp_file.unlink()
 
-def build_atf():
+def build_atf(crossprefix : str):
     build_dir = Path('build-atf')
 
     built_stamp_file = Path(build_dir) / '.built_checked'
     n_threads = multiprocessing.cpu_count()
     try:
-        subprocess.run(['make', '-C', str(build_dir.absolute()), '-j', str(n_threads)],
+        subprocess.run(['make', '-C', str(build_dir.absolute()), '-j', str(n_threads),
+                        'CROSS_COMPILE={}'.format(crossprefix)],
                        check=True, capture_output=True)
         built_stamp_file.touch(exist_ok=True)
     except CalledProcessError:
@@ -219,6 +221,7 @@ if __name__ == '__main__':
 
     parser_build = subparsers.add_parser('build')
     parser_build.add_argument('target', choices=targets)
+    parser_build.add_argument('--cross', dest='crossprefix', default='aarch64-linux-gnu-')
 
     subparsers.add_parser('firmware', help='packing the firmware')
 
@@ -234,8 +237,6 @@ if __name__ == '__main__':
                 index = machines_choices.index(args.machine)
             except ValueError:
                 print("can't find machine {}".format(args.machine))
-                index = None
-            if index is None:
                 exit(1)
 
             machine = machines[index]
@@ -244,9 +245,9 @@ if __name__ == '__main__':
         case 'build':
             match args.target:
                 case 'all':
-                    build_uboot()
-                    build_atf()
+                    build_uboot(args.crossprefix)
+                    build_atf(args.crossprefix)
                 case 'atf':
-                    build_atf()
+                    build_atf(args.crossprefix)
                 case 'u-boot':
-                    build_uboot()
+                    build_uboot(args.crossprefix)
