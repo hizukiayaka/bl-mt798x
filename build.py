@@ -44,10 +44,18 @@ class RouterMachine(TypedDict):
     storage: Required[StorageChipType]
     defconfig: NotRequired[str]
 
+def clean_build_output():
+    build_dir = Path('build-atf')
+    shutil.rmtree(build_dir)
+    build_dir = Path('build-u-boot')
+    shutil.rmtree(build_dir)
+    out_dir = Path('out')
+    shutil.rmtree(out_dir)
+
 def check_build_directory(sub_mod: git.objects.submodule.base.Submodule):
     mod_name = sub_mod.name
-    build_dir = 'build-{0}'.format(mod_name)
-    unpack_stamp_file = Path(build_dir) / '.unpack_checked'
+    build_dir = Path('build-{0}'.format(mod_name))
+    unpack_stamp_file = build_dir / '.unpack_checked'
 
     if unpack_stamp_file.is_file():
         print("{0} build directory exists".format(mod_name))
@@ -71,7 +79,7 @@ def prepare_submodule():
 def copy_quilt_files_to_build(sub_mod: git.objects.submodule.base.Submodule):
     mod_name = sub_mod.name
     build_dir = Path('build-{0}'.format(mod_name))
-    unpack_stamp_file = Path(build_dir) / '.unpack_checked'
+    unpack_stamp_file = build_dir / '.unpack_checked'
     quilt_prepare_stamp_file = Path(build_dir) / '.quilt_checked'
 
     if quilt_prepare_stamp_file.is_file():
@@ -98,7 +106,7 @@ def apply_patches_in_build(sub_mod: git.objects.submodule.base.Submodule):
     mod_name = sub_mod.name
     build_dir = Path('build-{0}'.format(mod_name))
 
-    quilt_prepare_stamp_file = Path(build_dir) / '.quilt_checked'
+    quilt_prepare_stamp_file = build_dir / '.quilt_checked'
     if not quilt_prepare_stamp_file.is_file():
         print("{0} is not prepared by us".format(build_dir))
         return
@@ -134,11 +142,11 @@ def copy_and_apply_patches():
 def configura_uboot(defconfig : str):
     build_dir = Path('build-u-boot')
 
-    configed_stamp_file = Path(build_dir) / '.config_checked'
+    configed_stamp_file = build_dir / '.config_checked'
     try:
+        configed_stamp_file.touch(exist_ok=True)
         subprocess.run(['make', '-C', str(build_dir.absolute()), defconfig],
                        check=True, capture_output=True)
-        configed_stamp_file.touch(exist_ok=True)
     except subprocess.CalledProcessError:
         configed_stamp_file.unlink()
 
@@ -165,37 +173,111 @@ def write_atf_config_file(machine: RouterMachine, boot_to_ram: bool):
 
     configed_stamp_file = Path(build_dir) / '.config_checked'
     try:
+        configed_stamp_file.touch(exist_ok=True)
         subprocess.run(['make', '-C', str(build_dir.absolute()), 'defconfig'],
                        check=True, capture_output=True)
-        configed_stamp_file.touch(exist_ok=True)
     except subprocess.CalledProcessError:
         configed_stamp_file.unlink()
 
 def build_uboot(crossprefix : str):
     build_dir = Path('build-u-boot')
 
-    built_stamp_file = Path(build_dir) / '.built_checked'
+    configed_stamp_file = build_dir / '.config_checked'
+    if not configed_stamp_file.is_file():
+        print("u-boot is not configured!")
+        return 1;
+
+    built_stamp_file = build_dir / '.built_checked'
     n_threads = multiprocessing.cpu_count()
     try:
+        built_stamp_file.touch(exist_ok=True)
         subprocess.run(['make', '-C', str(build_dir.absolute()), '-j', str(n_threads),
                         'CROSS_COMPILE={}'.format(crossprefix)],
                        check=True, capture_output=True)
-        built_stamp_file.touch(exist_ok=True)
     except subprocess.CalledProcessError:
         built_stamp_file.unlink()
 
 def build_atf(crossprefix : str):
     build_dir = Path('build-atf')
 
-    built_stamp_file = Path(build_dir) / '.built_checked'
+    configed_stamp_file = build_dir / '.config_checked'
+    if not configed_stamp_file.is_file():
+        print("arm trusted firmware is not configured!")
+        return 1;
+
+    built_stamp_file = build_dir / '.built_checked'
     n_threads = multiprocessing.cpu_count()
     try:
+        built_stamp_file.touch(exist_ok=True)
         subprocess.run(['make', '-C', str(build_dir.absolute()), '-j', str(n_threads),
                         'CROSS_COMPILE={}'.format(crossprefix)],
                        check=True, capture_output=True)
-        built_stamp_file.touch(exist_ok=True)
-    except CalledProcessError:
+    except subprocess.CalledProcessError:
         built_stamp_file.unlink()
+
+def build_firmware():
+    build_dir = Path('build-u-boot')
+    built_stamp_file = build_dir / '.built_checked'
+
+    if not built_stamp_file.is_file():
+        print("u-boot is not built or built by us")
+        return 1;
+
+    bl33_file = build_dir / 'u-boot.bin'
+    if not bl33_file.is_file():
+        print("can't find u-boot image")
+        built_stamp_file.unlink()
+        return 1
+
+    machine : str = 'unkown'
+    with open(build_dir / '.config') as file:
+        for line in file:
+            m = re.search(r'^CONFIG_DEFAULT_DEVICE_TREE="(.*)"', line)
+            if m:
+                machine = m.group(1)
+                break;
+
+    build_dir = Path('build-atf')
+    subprocess.run(['make', f'BL33={bl33_file.absolute()!s}', \
+                    '-C', str(build_dir.absolute()), 'fip'],
+                    check=True, capture_output=True)
+
+    sub_build_dir = build_dir / 'build'
+    boot_to_ram : bool = False
+    soc : str = 'none'
+    ram_type : str = 'noram'
+    with open(sub_build_dir / '.config') as file:
+        for line in file:
+            m = re.search(r'^PLAT="(\w+)"', line)
+            if m:
+                soc = m.group(1)
+                continue
+            m = re.search(r'^_DRAM_(\s{,1}DDR\d)=y', line)
+            if m:
+                ram_type = m.group(1).lower()
+                continue
+            if re.search(r'^_BOOT_DEVICE_RAM=y', line):
+                boot_to_ram = True
+                break
+
+    atf_out_dir = sub_build_dir / soc / 'release'
+    out_dir = Path('out')
+    out_dir.mkdir(exist_ok=True)
+
+    if boot_to_ram:
+        bl2_file = atf_out_dir / 'bl2.bin'
+        out_bl2_file = out_dir / f'{soc!s}-{ram_type!s}-bl2-ramload.bin'
+    else:
+        bl2_file = atf_out_dir / 'bl2.img'
+        out_bl2_file = out_dir / f'{soc!s}-{ram_type!s}-bl2-boot.bin'
+
+    if not bl2_file.is_file():
+        print("BL2 file is not generated")
+        return 1
+
+    shutil.copyfile(bl2_file, out_bl2_file)
+    shutil.copyfile(atf_out_dir / 'fip.bin', out_dir / f'{machine!s}-bl31-uboot.fip')
+
 
 if __name__ == '__main__':
     machines : list[RouterMachine] = [ \
@@ -212,6 +294,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='build.py')
     subparsers = parser.add_subparsers(dest='step')
 
+    parser.add_argument('--machine', choices=machines_choices)
+    parser.add_argument('--ram', dest='boot_to_ram', action='store_true')
+    parser.add_argument('--cross', dest='crossprefix', default='aarch64-linux-gnu-')
+
+    subparsers.add_parser('clean', help='clean the building directory')
     subparsers.add_parser('unpack', help='prepare the build directory')
     subparsers.add_parser('patch', help='patch source codes')
 
@@ -228,6 +315,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     match args.step:
+        case 'clean':
+            clean_build_output()
         case 'unpack':
             prepare_submodule()
         case 'patch':
@@ -251,3 +340,26 @@ if __name__ == '__main__':
                     build_atf(args.crossprefix)
                 case 'u-boot':
                     build_uboot(args.crossprefix)
+        case 'firmware':
+            build_firmware()
+        case _:
+            try:
+                index = machines_choices.index(args.machine)
+            except ValueError:
+                print("can't find machine {}".format(args.machine))
+                exit(1)
+
+            clean_build_output()
+
+            prepare_submodule()
+            copy_and_apply_patches()
+
+            machine = machines[index]
+            write_atf_config_file(machine, args.boot_to_ram)
+            configura_uboot(machine['defconfig'])
+
+            build_uboot(args.crossprefix)
+            build_atf(args.crossprefix)
+
+            build_firmware()
+
