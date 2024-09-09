@@ -1,0 +1,38 @@
+--- a/arch/arm/dts/mt7986a-jdcloud_re-cp-03.dts
++++ b/arch/arm/dts/mt7986a-jdcloud_re-cp-03.dts
+@@ -80,14 +80,17 @@
+ 
+ &eth {
+ 	status = "okay";
+-	mediatek,gmac-id = <0>;
+-	phy-mode = "2500base-x";
+-	mediatek,switch = "mt7531";
+-	reset-gpios = <&gpio 5 GPIO_ACTIVE_HIGH>;
++	mediatek,gmac-id = <1>;
++	mediatek,sgmiisys = <&sgmiisys1>;
++	phy-mode = "sgmii";
++	phy-handle = <&phy6>;
+ 
+-	fixed-link {
+-		speed = <2500>;
+-		full-duplex;
++	phy6: eth-phy@6 {
++		compatible = "ethernet-phy-id001c.c849", "ethernet-phy-ieee802.3-c45";
++		reg = <6>;
++		reset-gpios = <&gpio 6 GPIO_ACTIVE_LOW>;
++		reset-assert-us = <15000>;
++		reset-deassert-us = <68000>;
+ 	};
+ };
+ 
+--- a/configs/mt7986a_jdcloud_re-cp-03_defconfig
++++ b/configs/mt7986a_jdcloud_re-cp-03_defconfig
+@@ -88,7 +88,7 @@
+ CONFIG_LED_GPIO=y
+ CONFIG_MMC_HS200_SUPPORT=y
+ CONFIG_MMC_MTK=y
+-CONFIG_PHY_FIXED=y
++CONFIG_PHY_REALTEK=y
+ CONFIG_DM_MDIO=y
+ CONFIG_MEDIATEK_ETH=y
+ CONFIG_PHY=y
